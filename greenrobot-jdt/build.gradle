@@ -42,7 +42,8 @@ shadowJar {
     relocate 'org.apache', "${project.group}.apache"
     relocate 'org.osgi', "${project.group}.osgi"
 
-    archiveClassifier = null // would default to "all"
+    // Use empty classifier avoided (conflicts with main jar), keep default "all" or set explicit
+    // archiveClassifier = null // would default to "all"
 }
 
 apply plugin: 'maven-publish'
@@ -71,8 +72,11 @@ publishing {
 
     publications {
         shadow(MavenPublication) {
-            from project.components.java
+            groupId = project.group
+            artifactId = project.name
+            version = project.version
 
+            // Publish only the shadow jar (with relocated dependencies), not the plain jar
             artifact tasks.named('shadowJar')
             artifact tasks.named('javadocJar')
             artifact tasks.named('sourcesJar')
