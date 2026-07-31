@@ -26,6 +26,9 @@ import org.gradle.api.file.FileTree
 import org.gradle.api.plugins.JavaPluginExtension
 import org.gradle.api.tasks.compile.JavaCompile
 import java.io.File
+import java.lang.reflect.InvocationHandler
+import java.lang.reflect.Method
+import java.lang.reflect.Proxy
 
 interface SourceProvider {
     fun sourceFiles(): Sequence<FileTree>
@@ -48,30 +51,88 @@ class AndroidPluginSourceProvider(val project: Project) : SourceProvider {
         // Try application extension first (AGP 9 compatible)
         val appExtension = project.extensions.findByType(ApplicationAndroidComponentsExtension::class.java)
         if (appExtension != null) {
-            appExtension.onVariants { variant ->
-                variant.sources.java?.addGeneratedSourceDirectory(
-                    generatorTask,
-                    GreendaoGenerateTask::outputDir
-                )
-            }
+            registerGeneratedSources(appExtension, generatorTask)
             return
         }
 
         // Try library extension
         val libExtension = project.extensions.findByType(LibraryAndroidComponentsExtension::class.java)
         if (libExtension != null) {
-            libExtension.onVariants { variant ->
-                variant.sources.java?.addGeneratedSourceDirectory(
-                    generatorTask,
-                    GreendaoGenerateTask::outputDir
-                )
-            }
+            registerGeneratedSources(libExtension, generatorTask)
             return
         }
 
-        // Fallback: add to source sets directly (for non-Android or older AGP)
-        project.tasks.named("compileJava").configure {
-            it.dependsOn(generatorTask)
+        // Fallback: add to compile task directly
+        project.tasks.withType(JavaCompile::class.java).configureEach { compileTask ->
+            compileTask.dependsOn(generatorTask)
+        }
+    }
+
+    private fun registerGeneratedSources(extension: Any, generatorTask: org.gradle.api.tasks.TaskProvider<GreendaoGenerateTask>) {
+        // Use reflection to call onVariants with a dynamically created proxy
+        // This avoids AGP 9 type system issues where the callback parameter type is not accessible
+        try {
+            val onVariantsMethod = extension.javaClass.methods.first { it.name == "onVariants" }
+            val callbackType = onVariantsMethod.parameterTypes.last()
+
+            val proxy = Proxy.newProxyInstance(
+                callbackType.classLoader,
+                arrayOf(callbackType)
+            ) { _: Any, method: Method, args: Array<Any?>? ->
+                if (method.name == "invoke" && args != null && args.isNotEmpty()) {
+                    val variant = args[0]
+                    onVariant(variant, generatorTask)
+                }
+                null
+            }
+
+            if (onVariantsMethod.parameterTypes.size == 1) {
+                onVariantsMethod.invoke(extension, proxy)
+            } else {
+                // Two parameters: selector and callback
+                val selectorType = onVariantsMethod.parameterTypes[0]
+                val selector = Proxy.newProxyInstance(
+                    selectorType.classLoader,
+                    arrayOf(selectorType)
+                ) { _: Any, _: Method, _: Array<Any?>? -> null }
+                onVariantsMethod.invoke(extension, selector, proxy)
+            }
+        } catch (e: Exception) {
+            project.logger.info("greenDAO: Could not register via onVariants, using fallback: ${e.message}")
+            // Fallback: make compile tasks depend on generator
+            project.tasks.withType(JavaCompile::class.java).configureEach { compileTask ->
+                compileTask.dependsOn(generatorTask)
+            }
+        }
+    }
+
+    private fun onVariant(variant: Any?, generatorTask: org.gradle.api.tasks.TaskProvider<GreendaoGenerateTask>) {
+        if (variant == null) return
+        try {
+            val sources = variant.javaClass.getMethod("sources").invoke(variant)
+            val javaSources = sources.javaClass.getMethod("java").invoke(sources)
+            if (javaSources != null) {
+                val addMethod = javaSources.javaClass.methods.first { it.name == "addGeneratedSourceDirectory" }
+                val wiringType = addMethod.parameterTypes.last()
+
+                val wiring = Proxy.newProxyInstance(
+                    wiringType.classLoader,
+                    arrayOf(wiringType)
+                ) { _: Any, _: Method, args: Array<Any?>? ->
+                    if (args != null && args.isNotEmpty()) {
+                        val task = args[0] ?: return@newProxyInstance null
+                        task.javaClass.getMethod("getOutputDir").invoke(task)
+                    } else {
+                        null
+                    }
+                }
+
+                if (addMethod.parameterTypes.size == 2) {
+                    addMethod.invoke(javaSources, generatorTask, wiring)
+                }
+            }
+        } catch (e: Exception) {
+            project.logger.debug("greenDAO: Could not register generated sources: ${e.message}")
         }
     }
 }
