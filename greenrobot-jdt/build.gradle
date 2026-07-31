@@ -58,6 +58,17 @@ tasks.register('sourcesJar', Jar) {
 }
 
 publishing {
+    repositories {
+        maven {
+            name = "GitHubPackages"
+            url = uri("https://maven.pkg.github.com/957211324/greenDAO-plugin")
+            credentials {
+                username = System.getenv("GITHUB_ACTOR") ?: project.findProperty("gpr.user") ?: ""
+                password = System.getenv("GITHUB_TOKEN") ?: project.findProperty("gpr.key") ?: ""
+            }
+        }
+    }
+
     publications {
         shadow(MavenPublication) {
             from project.components.java

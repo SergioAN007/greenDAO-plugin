@@ -54,6 +54,10 @@ tasks.named('processResources').configure {
 
 apply plugin: 'maven-publish'
 
+// Note: Gradle plugin marker is handled by the META-INF/gradle-plugins/*.properties file
+// and the `gradlePlugin` DSL is not available without `java-gradle-plugin`.
+// The marker artifact will be published manually if needed.
+
 tasks.register('javadocJar', Jar) {
     archiveClassifier = 'javadoc'
     from 'README'
@@ -65,6 +69,17 @@ tasks.register('sourcesJar', Jar) {
 }
 
 publishing {
+    repositories {
+        maven {
+            name = "GitHubPackages"
+            url = uri("https://maven.pkg.github.com/957211324/greenDAO-plugin")
+            credentials {
+                username = System.getenv("GITHUB_ACTOR") ?: project.findProperty("gpr.user") ?: ""
+                password = System.getenv("GITHUB_TOKEN") ?: project.findProperty("gpr.key") ?: ""
+            }
+        }
+    }
+
     publications {
         maven(MavenPublication) {
             from components.java
@@ -74,7 +89,7 @@ publishing {
 
             pom {
                 name = 'greenDAO Gradle Plugin'
-                description = 'Gradle Plugin for greenDAO, the light and fast ORM for Android'
+                description = 'Gradle Plugin for greenDAO, the light and fast ORM for Android. Gradle 9 / AGP 9 compatible.'
                 url = 'https://github.com/957211324/greenDAO-plugin'
 
                 licenses {
