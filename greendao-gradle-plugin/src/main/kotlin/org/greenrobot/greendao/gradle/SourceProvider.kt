@@ -18,11 +18,10 @@
 
 package org.greenrobot.greendao.gradle
 
-import com.android.build.api.variant.AndroidComponentsExtension
+import com.android.build.api.variant.ApplicationAndroidComponentsExtension
+import com.android.build.api.variant.LibraryAndroidComponentsExtension
 import org.gradle.api.Project
 import org.gradle.api.Task
-import org.gradle.api.file.Directory
-import org.gradle.api.file.DirectoryProperty
 import org.gradle.api.file.FileTree
 import org.gradle.api.plugins.JavaPluginExtension
 import org.gradle.api.tasks.compile.JavaCompile
@@ -32,13 +31,10 @@ interface SourceProvider {
     fun sourceFiles(): Sequence<FileTree>
     fun sourceTree(): FileTree = sourceFiles().reduce { a, b -> a + b }
     val encoding: String? get
-    fun addGeneratorTask(generatorTask: Task, targetGenDir: File, writeToBuildFolder: Boolean)
+    fun addGeneratorTask(generatorTask: org.gradle.api.tasks.TaskProvider<GreendaoGenerateTask>, targetGenDir: File, writeToBuildFolder: Boolean)
 }
 
 class AndroidPluginSourceProvider(val project: Project) : SourceProvider {
-
-    private val androidComponents: AndroidComponentsExtension<*, *, *> =
-        project.extensions.getByType(AndroidComponentsExtension::class.java)
 
     override fun sourceFiles(): Sequence<FileTree> {
         // Source files are collected by DetectEntityCandidatesTask at build time
@@ -48,18 +44,34 @@ class AndroidPluginSourceProvider(val project: Project) : SourceProvider {
     override val encoding: String?
         get() = project.tasks.withType(JavaCompile::class.java).firstOrNull()?.options?.encoding
 
-    override fun addGeneratorTask(generatorTask: Task, targetGenDir: File, writeToBuildFolder: Boolean) {
-        androidComponents.onVariants { variant ->
-            val taskProvider = project.tasks.named(generatorTask.name)
-
-            // Register generated source directory with the variant (AGP 8+ API)
-            val outputDirProperty: DirectoryProperty = project.objects.directoryProperty()
-            outputDirProperty.set(targetGenDir)
-            variant.sources.java?.addGeneratedSourceDirectory(
-                taskProvider
-            ) { task ->
-                outputDirProperty
+    override fun addGeneratorTask(generatorTask: org.gradle.api.tasks.TaskProvider<GreendaoGenerateTask>, targetGenDir: File, writeToBuildFolder: Boolean) {
+        // Try application extension first (AGP 9 compatible)
+        val appExtension = project.extensions.findByType(ApplicationAndroidComponentsExtension::class.java)
+        if (appExtension != null) {
+            appExtension.onVariants { variant ->
+                variant.sources.java?.addGeneratedSourceDirectory(
+                    generatorTask,
+                    GreendaoGenerateTask::outputDir
+                )
             }
+            return
+        }
+
+        // Try library extension
+        val libExtension = project.extensions.findByType(LibraryAndroidComponentsExtension::class.java)
+        if (libExtension != null) {
+            libExtension.onVariants { variant ->
+                variant.sources.java?.addGeneratedSourceDirectory(
+                    generatorTask,
+                    GreendaoGenerateTask::outputDir
+                )
+            }
+            return
+        }
+
+        // Fallback: add to source sets directly (for non-Android or older AGP)
+        project.tasks.named("compileJava").configure {
+            it.dependsOn(generatorTask)
         }
     }
 }
@@ -74,7 +86,7 @@ class JavaPluginSourceProvider(val project: Project) : SourceProvider {
     override val encoding: String?
         get() = project.tasks.withType(JavaCompile::class.java).firstOrNull()?.options?.encoding
 
-    override fun addGeneratorTask(generatorTask: Task, targetGenDir: File, writeToBuildFolder: Boolean) {
+    override fun addGeneratorTask(generatorTask: org.gradle.api.tasks.TaskProvider<GreendaoGenerateTask>, targetGenDir: File, writeToBuildFolder: Boolean) {
         // for the main source set...
         val mainSourceSet = javaPlugin.sourceSets.maybeCreate("main")
         // ...make the compile task depend on the generator task
@@ -84,7 +96,7 @@ class JavaPluginSourceProvider(val project: Project) : SourceProvider {
             // ...add the generated sources folder to the source dirs
             mainSourceSet.java.srcDir(targetGenDir)
             // ...ensure the compile task has them on the classpath
-            compileJavaTask.setSource(compileJavaTask.source + generatorTask.outputs.files)
+            compileJavaTask.setSource(compileJavaTask.source + generatorTask.map { it.outputs.files })
         }
     }
 }
