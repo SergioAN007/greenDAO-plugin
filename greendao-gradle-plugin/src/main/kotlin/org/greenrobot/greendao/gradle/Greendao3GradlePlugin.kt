@@ -20,16 +20,8 @@ package org.greenrobot.greendao.gradle
 
 import org.gradle.api.Plugin
 import org.gradle.api.Project
-import org.gradle.api.file.DirectoryProperty
+import org.gradle.api.Task
 import org.gradle.api.logging.LogLevel
-import org.gradle.api.tasks.Input
-import org.gradle.api.tasks.InputFile
-import org.gradle.api.tasks.Internal
-import org.gradle.api.tasks.Optional
-import org.gradle.api.tasks.OutputDirectory
-import org.gradle.api.tasks.PathSensitive
-import org.gradle.api.tasks.PathSensitivity
-import org.gradle.api.tasks.TaskAction
 import org.gradle.api.tasks.util.PatternFilterable
 import org.greenrobot.greendao.codemodifier.Greendao3Generator
 import org.greenrobot.greendao.codemodifier.SchemaOptions
@@ -45,6 +37,14 @@ class Greendao3GradlePlugin : Plugin<Project> {
     override fun apply(project: Project) {
         project.logger.debug("$name plugin starting...")
         project.extensions.create(name, GreendaoOptions::class.java, project)
+
+        // FIX: AGP 9 requires onVariants to be registered before its own afterEvaluate.
+        // Hook variants as soon as the Android plugin is applied (works in any plugin order).
+        listOf("com.android.application", "com.android.library").forEach { id ->
+            project.pluginManager.withPlugin(id) {
+                AndroidPluginSourceProvider.registerVariantSources(project) { resolveGenDir(project) }
+            }
+        }
 
         // Use afterEvaluate so order of applying the plugins in consumer projects does not matter
         project.afterEvaluate {
@@ -67,29 +67,59 @@ class Greendao3GradlePlugin : Plugin<Project> {
 
             val options = project.extensions.getByType(GreendaoOptions::class.java)
             val writeToBuildFolder = options.targetGenDir == null
-            val targetGenDir = if (writeToBuildFolder)
-                File(project.buildDir, "generated/source/$name") else options.targetGenDir!!
+            val targetGenDir = resolveGenDir(project)
 
             val greendaoTask = createGreendaoTask(project, candidatesFile, options, targetGenDir, encoding, version)
             greendaoTask.configure { it.dependsOn(prepareTask) }
 
-            sourceProvider.addGeneratorTask(greendaoTask, targetGenDir, writeToBuildFolder)
+            sourceProvider.addGeneratorTask(greendaoTask.get(), targetGenDir, writeToBuildFolder)
         }
     }
 
+    private fun resolveGenDir(project: Project): File {
+        val options = project.extensions.getByType(GreendaoOptions::class.java)
+        return options.targetGenDir
+            ?: File(project.layout.buildDirectory.get().asFile, "generated/source/$name")
+    }
+
     private fun createGreendaoTask(project: Project, candidatesFile: File, options: GreendaoOptions,
-                                   targetGenDir: File, encoding: String, version: String): org.gradle.api.tasks.TaskProvider<GreendaoGenerateTask> {
-        return project.tasks.register(name, GreendaoGenerateTask::class.java) { task ->
-            task.outputDir.set(targetGenDir)
-            task.candidatesFile.set(candidatesFile)
-            task.pluginVersion.set(version)
-            task.sourceEncoding.set(encoding)
-            task.daoPackage.set(options.daoPackage ?: "")
-            task.schemaVersion.set(options.schemaVersion)
-            task.skipTestGeneration.set(options.skipTestGeneration)
-            task.generateTests.set(options.generateTests)
-            task.targetGenDirTests.set(options.targetGenDirTests)
-            task.formattingData.set(options.formatting.data)
+                                   targetGenDir: File, encoding: String, version: String): org.gradle.api.tasks.TaskProvider<Task> {
+        return project.tasks.register(name) { task ->
+            task.logging.captureStandardOutput(LogLevel.INFO)
+
+            task.inputs.file(candidatesFile)
+            task.inputs.property("plugin-version", version)
+            task.inputs.property("source-encoding", encoding)
+
+            val schemaOptions = collectSchemaOptions(options.daoPackage, targetGenDir, options)
+
+            schemaOptions.forEach { e ->
+                task.inputs.property("schema-${e.key}", e.value.toString())
+            }
+
+            val outputFileTree = project.fileTree(targetGenDir) { pf: PatternFilterable ->
+                pf.include("**/*Dao.java", "**/DaoSession.java", "**/DaoMaster.java")
+            }
+            task.outputs.files(outputFileTree)
+
+            if (options.generateTests) {
+                task.outputs.dir(options.targetGenDirTests)
+            }
+
+            task.doLast {
+                require(candidatesFile.exists()) {
+                    "Candidates file does not exist. Can't continue"
+                }
+
+                // read candidates file skipping first for timestamp
+                val candidatesFiles = candidatesFile.readLines().asSequence().drop(1).map { File(it) }.asIterable()
+
+                Greendao3Generator(
+                    options.formatting.data,
+                    options.skipTestGeneration,
+                    encoding
+                ).run(candidatesFiles, schemaOptions)
+            }
 
             task.group = name
             task.description = "Generates source files for $name"
@@ -107,6 +137,33 @@ class Greendao3GradlePlugin : Plugin<Project> {
             }
         }
         return properties.getProperty("version") ?: "Unknown (bad build)"
+    }
+
+    private fun collectSchemaOptions(daoPackage: String?, genSrcDir: File, options: GreendaoOptions)
+            : MutableMap<String, SchemaOptions> {
+        val defaultOptions = SchemaOptions(
+            name = "default",
+            version = options.schemaVersion,
+            daoPackage = daoPackage,
+            outputDir = genSrcDir,
+            testsOutputDir = if (options.generateTests) options.targetGenDirTests else null
+        )
+
+        val schemaOptions = mutableMapOf("default" to defaultOptions)
+
+        options.schemas.schemasMap.map { e ->
+            val (name, schemaExt) = e
+            SchemaOptions(
+                name = name,
+                version = schemaExt.version ?: defaultOptions.version,
+                daoPackage = schemaExt.daoPackage ?: defaultOptions.daoPackage?.let { "$it.$name" },
+                outputDir = defaultOptions.outputDir,
+                testsOutputDir = if (options.generateTests) {
+                    schemaExt.targetGenDirTests ?: defaultOptions.testsOutputDir
+                } else null
+            )
+        }.associateTo(schemaOptions) { it.name to it }
+        return schemaOptions
     }
 
     val ANDROID_PLUGINS = listOf(
@@ -127,72 +184,4 @@ class Greendao3GradlePlugin : Plugin<Project> {
         }
     }
 
-}
-
-/**
- * Task that generates greenDAO source files.
- * Exposes outputDir as a DirectoryProperty for use with AGP 9's addGeneratedSourceDirectory API.
- */
-abstract class GreendaoGenerateTask : org.gradle.api.DefaultTask() {
-    @get:OutputDirectory
-    abstract val outputDir: DirectoryProperty
-
-    @get:InputFile
-    @get:PathSensitive(PathSensitivity.NONE)
-    abstract val candidatesFile: org.gradle.api.file.RegularFileProperty
-
-    @get:Input
-    abstract val pluginVersion: org.gradle.api.provider.Property<String>
-
-    @get:Input
-    abstract val sourceEncoding: org.gradle.api.provider.Property<String>
-
-    @get:Input
-    @get:Optional
-    abstract val daoPackage: org.gradle.api.provider.Property<String>
-
-    @get:Input
-    abstract val schemaVersion: org.gradle.api.provider.Property<Int>
-
-    @get:Input
-    abstract val skipTestGeneration: org.gradle.api.provider.ListProperty<String>
-
-    @get:Input
-    abstract val generateTests: org.gradle.api.provider.Property<Boolean>
-
-    @get:Internal
-    abstract val targetGenDirTests: org.gradle.api.file.DirectoryProperty
-
-    @get:Internal
-    abstract val formattingData: org.gradle.api.provider.Property<org.greenrobot.greendao.codemodifier.FormattingOptions>
-
-    @TaskAction
-    fun generate() {
-        logging.captureStandardOutput(LogLevel.INFO)
-
-        val candidatesFile = candidatesFile.get().asFile
-        val outputDir = outputDir.get().asFile
-        val encoding = sourceEncoding.get()
-
-        require(candidatesFile.exists()) {
-            "Candidates file does not exist. Can't continue"
-        }
-
-        // read candidates file skipping first line for timestamp
-        val candidatesFiles = candidatesFile.readLines().asSequence().drop(1).map { File(it) }.asIterable()
-
-        val schemaOptions = mutableMapOf("default" to SchemaOptions(
-            name = "default",
-            version = schemaVersion.get(),
-            daoPackage = daoPackage.get().ifEmpty { null },
-            outputDir = outputDir,
-            testsOutputDir = if (generateTests.get()) targetGenDirTests.get().asFile else null
-        ))
-
-        Greendao3Generator(
-            formattingData.get(),
-            skipTestGeneration.get(),
-            encoding
-        ).run(candidatesFiles, schemaOptions)
-    }
 }
